@@ -1,0 +1,21 @@
+UI update - 2026-10-26
+
+Started from the current scripts in Studio, including the user's renamed server fields.
+The UI is stored under StarterGui > AsterHUD and can be edited using Explorer and Properties.
+ArcheryClient waits for Roblox to copy that UI into PlayerGui; it does not create UI instances.
+The 3D aiming guide and impact anchor parts are still created locally during play.
+
+BuildUI.studio.luau is a one-time EDIT-MODE setup script for recreating the UI in another place.
+Do not install it as a running game script. The existing game already contains the finished UI.
+Run BuildRange.studio.luau first only when building a fresh copy of the entire demo.
+Then run BuildUI.studio.luau in Studio edit mode and install the server/client scripts.
+
+Playtest results:
+- StarterGui and PlayerGui HUD both contained 55 UI descendants.
+- Full charge showed the aiming guide and saved landing marker.
+- A hit scored 8 points and displayed the saved +8 popup; UI count stayed 55.
+- Moving the struck target retained arrow attachment with zero position error.
+- Respawn kept exactly one HUD with 55 descendants and restored the bow.
+- The saved challenge button started the 60-second round and reset the score.
+- No archery-script errors appeared in the playtest output.
+- Touch gesture handling was implemented but not exercised on a physical mobile device.

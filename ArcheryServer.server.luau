@@ -1,12 +1,11 @@
 -- Discord: lordx997 | Roblox: TheRealRacion
--- ASTER ARCHERY | Main submission candidate. Review and rewrite explanations in your own words.
--- One cohesive server controller: clients request actions; this script owns time, trajectories and scores.
+-- The server checks shots, moves arrows, and keeps score.
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
--- WaitForChild tolerates replication/startup order without assuming other assets initialize first.
+-- Shared settings and models.
 local Package = ReplicatedStorage:WaitForChild("AsterArchery")
 local Remote = Package:WaitForChild("Action")
 local Assets = Package:WaitForChild("Assets")
@@ -33,16 +32,17 @@ local TargetData = {}
 local HeartbeatAccumulator = 0
 local StateAccumulator = 0
 
--- A separate folder gives every shot a cheap shared exclusion filter, including parked pool models.
+-- Keep arrows together so collision checks can ignore them.
 local Projectiles = Instance.new("Folder")
 Projectiles.Name = "ArcheryProjectiles"
 Projectiles.Parent = Workspace
 
--- Reject NaN and infinity before normalization: either would poison CFrame math and the physics loop.
+-- Reject invalid numbers before using them in movement calculations.
 local function Finite(Number)
     return Number == Number and math.abs(Number) < 1e6
 end
 
+-- Check that the aim is a valid direction.
 local function ValidDirection(Value)
     if typeof(Value) ~= "Vector3" then
         return false
@@ -52,7 +52,7 @@ local function ValidDirection(Value)
 end
 
 local function GetArcher(Player)
-    -- Resolve the current character for every action; a cached character becomes stale after respawn.
+    -- Get the current character because respawning replaces the old one.
     local Character = Player.Character
     local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
     local Head = Character and Character:FindFirstChild("Head")
@@ -60,7 +60,7 @@ local function GetArcher(Player)
     if not Humanoid or Humanoid.Health <= 0 or not Head or not Tool or not Tool:IsA("Tool") then
         return nil
     end
-    -- Range bounds prevent an equipped tool elsewhere in this existing place from running the demo.
+    -- Only allow shots near the archery range.
     if (Head.Position - Spawn.Position).Magnitude > 260 then
         return nil
     end
@@ -68,45 +68,45 @@ local function GetArcher(Player)
 end
 
 local function SendState(Player, Session)
-    -- Send only presentation data to its owner; connection handles and server rate limits stay private.
+    -- Send this player's score and round status to their HUD.
     Remote:FireClient(Player, "State", {
-        score = Session.score,
-        shots = Session.shots,
-        hits = Session.hits,
-        best = Session.best,
-        streak = Session.streak,
-        mode = Session.mode,
-        endsAt = Session.endsAt,
-        drawAt = Session.drawAt,
+        Score = Session.Score,
+        Shots = Session.Shots,
+        Hits = Session.Hits,
+        Best = Session.Best,
+        Streak = Session.Streak,
+        Mode = Session.Mode,
+        EndsAt = Session.EndsAt,
+        DrawAt = Session.DrawAt,
     })
 end
 
 local function CancelDraw(Player, Session, Reason)
-    -- Clearing the timestamp makes a later Release harmless even if the client misses this reply.
-    Session.drawAt = nil
+    -- Clear the draw time so a cancelled shot cannot fire later.
+    Session.DrawAt = nil
     Remote:FireClient(Player, "Cancel", Reason)
 end
 
--- The token bucket limits all client actions, including malformed messages, before expensive work.
+-- Limit requests so one player cannot overload the server.
 local function ConsumeToken(Session, Time)
-    -- Refill by elapsed time, not frame count, so clients receive the same allowance at any framerate.
-    Session.tokens = math.min(12, Session.tokens + (Time - Session.tokenAt) * 8)
-    Session.tokenAt = Time
-    if Session.tokens < 1 then
+    -- Restore request allowance based on time, not frame rate.
+    Session.Tokens = math.min(12, Session.Tokens + (Time - Session.TokenAt) * 8)
+    Session.TokenAt = Time
+    if Session.Tokens < 1 then
         return false
     end
-    Session.tokens -= 1
+    Session.Tokens -= 1
     return true
 end
 
--- Reusing complete arrow models avoids allocating and destroying many replicated parts per shot.
+-- Reuse arrow models to avoid creating parts for every shot.
 for Index = 1, PoolSize do
     local Model = Assets.Arrow:Clone()
     Model.Name = "PooledArrow"
     Model:PivotTo(CFrame.new(0, -1000, 0))
     Model.Parent = Projectiles
     table.insert(FreeModels, Model)
-    -- Yield in bounded batches so initialization does not monopolize Studio's simulation thread.
+    -- Pause briefly while preparing the arrow pool to keep Studio responsive.
     if Index % 32 == 0 then
         task.wait()
     end
@@ -116,26 +116,26 @@ for _, Model in TargetsFolder:GetChildren() do
     local Face = Model:FindFirstChild("Hitbox")
     if Face and Face:IsA("BasePart") then
         TargetData[Face] = {
-            model = Model,
-            base = Model:GetPivot(), -- Preserve the original frame so sinusoidal movement never drifts.
-            radius = Face:GetAttribute("Radius"),
-            amplitude = Model:GetAttribute("Amplitude") or 0,
-            frequency = Model:GetAttribute("Frequency") or 1,
-            phase = Model:GetAttribute("Phase") or 0,
+            Model = Model,
+            Base = Model:GetPivot(), -- Save the starting position so target movement does not drift.
+            Radius = Face:GetAttribute("Radius"),
+            Amplitude = Model:GetAttribute("Amplitude") or 0,
+            Frequency = Model:GetAttribute("Frequency") or 1,
+            Phase = Model:GetAttribute("Phase") or 0,
         }
     end
 end
 
--- Object space removes world position and rotation, so scoring still works when a target moves.
+-- Measure hits relative to the target, even when it moves or rotates.
 local function RingScore(Result)
-    -- This lookup only recognizes the authored scoring surface, never a client-provided target name.
+    -- Only the server's known target faces can award points.
     local Target = TargetData[Result.Instance]
     if not Target then
         return 0, "MISS"
     end
     local Point = Result.Instance.CFrame:PointToObjectSpace(Result.Position)
-    local NormalizedRadius = Vector2.new(Point.X, Point.Y).Magnitude / Target.radius
-    -- A square collision face surrounds circular artwork; reject corners and hits from behind it.
+    local NormalizedRadius = Vector2.new(Point.X, Point.Y).Magnitude / Target.Radius
+    -- Ignore hits outside the circle or on the back of the target.
     if NormalizedRadius > 1 or Result.Normal:Dot(Result.Instance.CFrame.ZVector) < 0.6 then
         return 0, "OFF TARGET"
     end
@@ -152,31 +152,31 @@ local function RingScore(Result)
 end
 
 local Arrow = {}
--- Methods live on one shared table rather than allocating closures for every projectile.
+
 Arrow.__index = Arrow
 
 local function TrimEmbedded(Player)
     local Owned, Total = {}, {}
     for _, Arrow in ActiveArrows do
-        if Arrow.stuckAt and not Arrow.released then
+        if Arrow.StuckAt and not Arrow.Released then
             table.insert(Total, Arrow)
-            if Arrow.player == Player then
+            if Arrow.Player == Player then
                 table.insert(Owned, Arrow)
             end
         end
     end
     local function OldestFirst(A, B)
-        return A.stuckAt < B.stuckAt
+        return A.StuckAt < B.StuckAt
     end
     table.sort(Owned, OldestFirst)
     table.sort(Total, OldestFirst)
-    -- Keep landed arrows until their owner starts another round or replaces the oldest of twelve.
+    -- Keep the latest twelve landed arrows for each player.
     for Index = 1, math.max(0, #Owned - MaxEmbeddedPerPlayer) do
         Owned[Index]:Release()
     end
     local Count = 0
     for _, Arrow in Total do
-        if not Arrow.released then
+        if not Arrow.Released then
             Count += 1
         end
     end
@@ -184,7 +184,7 @@ local function TrimEmbedded(Player)
         if Count <= MaxEmbeddedTotal then
             break
         end
-        if not Arrow.released then
+        if not Arrow.Released then
             Arrow:Release()
             Count -= 1
         end
@@ -197,19 +197,19 @@ function Arrow.new(Player, Session, Origin, Velocity, Params)
         return nil
     end
     local Self = setmetatable({}, Arrow)
-    Self.model = Model
-    Self.player = Player
-    Self.sessionId = Session.id
-    Self.position = Origin
-    Self.velocity = Velocity
-    Self.params = Params
-    Self.age = 0
-    Self.distance = 0
-    Self.stuckPart = nil
-    Self.stuckAt = nil
-    Self.released = false
-    Model:PivotTo(CFrame.lookAt(Origin, Origin + Velocity)) -- Local -Z is the authored arrow direction.
-    -- Clear the old trail before enabling it, otherwise reusing a model can draw a streak across space.
+    Self.Model = Model
+    Self.Player = Player
+    Self.SessionId = Session.Id
+    Self.Pos = Origin
+    Self.Vel = Velocity
+    Self.Params = Params
+    Self.Age = 0
+    Self.Dist = 0
+    Self.StuckPart = nil
+    Self.StuckAt = nil
+    Self.Released = false
+    Model:PivotTo(CFrame.lookAt(Origin, Origin + Velocity)) -- The arrow model points along its local -Z axis.
+    -- Clear the old trail so a reused arrow does not leave a long streak.
     Model.Shaft.FlightTrail:Clear()
     Model.Shaft.FlightTrail.Enabled = true
     Model:SetAttribute("FlightState", "Flying")
@@ -219,26 +219,26 @@ function Arrow.new(Player, Session, Origin, Velocity, Params)
 end
 
 function Arrow.Release(Self)
-    -- Idempotence prevents disconnect cleanup and the simulation loop from returning a model twice.
-    if Self.released then
+    -- Return each arrow to the pool only once.
+    if Self.Released then
         return
     end
-    Self.released = true
-    Self.model.Shaft.FlightTrail.Enabled = false
-    Self.model:SetAttribute("FlightState", "Pooled")
-    Self.model:SetAttribute("ImpactPosition", nil)
-    Self.model:PivotTo(CFrame.new(0, -1000, 0))
-    table.insert(FreeModels, Self.model)
+    Self.Released = true
+    Self.Model.Shaft.FlightTrail.Enabled = false
+    Self.Model:SetAttribute("FlightState", "Pooled")
+    Self.Model:SetAttribute("ImpactPosition", nil)
+    Self.Model:PivotTo(CFrame.new(0, -1000, 0))
+    table.insert(FreeModels, Self.Model)
 end
 
 function Arrow.Resolve(Self, Result)
-    local Session = Sessions[Self.player]
-    if not Session or Session.id ~= Self.sessionId then
+    local Session = Sessions[Self.Player]
+    if not Session or Session.Id ~= Self.SessionId then
         return
     end
-    -- Session IDs prevent an arrow fired before restart from scoring in the next challenge.
+    -- Ignore arrows from an earlier round.
     local Time = Workspace:GetServerTimeNow()
-    if Session.mode == "Complete" or (Session.mode == "Challenge" and Time >= Session.endsAt) then
+    if Session.Mode == "Complete" or (Session.Mode == "Challenge" and Time >= Session.EndsAt) then
         return
     end
     local Points, Label = 0, "MISS"
@@ -246,105 +246,105 @@ function Arrow.Resolve(Self, Result)
         Points, Label = RingScore(Result)
     end
     if Points > 0 then
-        Session.hits += 1
-        Session.streak += 1
-        Session.score += Points
+        Session.Hits += 1
+        Session.Streak += 1
+        Session.Score += Points
     else
-        -- A miss resets consistency but does not remove points already earned on earlier shots.
-        Session.streak = 0
+        -- A miss ends the streak but keeps the points already earned.
+        Session.Streak = 0
     end
-    Remote:FireClient(Self.player, "Impact", {
-        points = Points,
-        label = Label,
-        position = Result and Result.Position or Self.position,
-        distance = math.floor(Self.distance),
+    Remote:FireClient(Self.Player, "Impact", {
+        Points = Points,
+        Label = Label,
+        Pos = Result and Result.Position or Self.Pos,
+        Dist = math.floor(Self.Dist),
     })
-    SendState(Self.player, Session)
+    SendState(Self.Player, Session)
 end
 
 function Arrow.Stick(Self, Result, Time)
     Self:Resolve(Result)
-    Self.model.Shaft.FlightTrail.Enabled = false
-    local Direction = Self.velocity.Unit
-    -- The model pivot is the arrow tip. A small inset embeds the tip without burying the shaft.
+    Self.Model.Shaft.FlightTrail.Enabled = false
+    local Direction = Self.Vel.Unit
+    -- Move the tip slightly into the surface so the arrow looks stuck.
     local Frame = CFrame.lookAt(Result.Position + Direction * 0.12, Result.Position + Direction)
-    Self.model:PivotTo(Frame)
-    Self.stuckPart = Result.Instance
-    -- Store a local offset rather than a world position, keeping embedded arrows attached to movers.
+    Self.Model:PivotTo(Frame)
+    Self.StuckPart = Result.Instance
+    -- Save the hit position relative to the part so the arrow follows it.
     if Result.Instance:IsA("BasePart") and not Result.Instance:IsA("Terrain") then
-        Self.stuckOffset = Result.Instance.CFrame:ToObjectSpace(Frame)
+        Self.StuckOffset = Result.Instance.CFrame:ToObjectSpace(Frame)
     end
-    Self.stuckFrame = Frame
-    Self.stuckAt = Time
-    Self.model:SetAttribute("FlightState", "Embedded")
-    Self.model:SetAttribute("ImpactPosition", Result.Position)
-    TrimEmbedded(Self.player)
+    Self.StuckFrame = Frame
+    Self.StuckAt = Time
+    Self.Model:SetAttribute("FlightState", "Embedded")
+    Self.Model:SetAttribute("ImpactPosition", Result.Position)
+    TrimEmbedded(Self.Player)
 end
 
 function Arrow.FollowSurface(Self)
-    if not Self.stuckPart:IsDescendantOf(Workspace) then
+    if not Self.StuckPart:IsDescendantOf(Workspace) then
         Self:Release()
         return
     end
-    local Frame = Self.stuckOffset and Self.stuckPart.CFrame * Self.stuckOffset or Self.stuckFrame
-    -- Static impacts need no repeated transforms; moving attachments update once per Heartbeat.
-    if Frame ~= Self.stuckFrame then
-        Self.model:PivotTo(Frame)
-        Self.stuckFrame = Frame
+    local Frame = Self.StuckOffset and Self.StuckPart.CFrame * Self.StuckOffset or Self.StuckFrame
+    -- Only reposition the arrow when the surface moves.
+    if Frame ~= Self.StuckFrame then
+        Self.Model:PivotTo(Frame)
+        Self.StuckFrame = Frame
     end
 end
 
 function Arrow.Step(Self, DeltaTime, Time)
-    Self.age += DeltaTime
-    -- Constant acceleration gives the exact segment endpoint; small steps limit chord error.
-    local Displacement = Self.velocity * DeltaTime + Gravity * (0.5 * DeltaTime * DeltaTime)
-    local Result = Workspace:Spherecast(Self.position, 0.07, Displacement, Self.params)
-    -- Sweeping the entire traveled segment prevents fast arrows tunneling through a thin target.
-    Self.distance += Result and Result.Distance or Displacement.Magnitude
+    Self.Age += DeltaTime
+    -- Apply gravity in small steps to follow the arrow's curved path.
+    local Displacement = Self.Vel * DeltaTime + Gravity * (0.5 * DeltaTime * DeltaTime)
+    local Result = Workspace:Spherecast(Self.Pos, 0.07, Displacement, Self.Params)
+    -- Check the whole step so fast arrows do not skip thin targets.
+    Self.Dist += Result and Result.Distance or Displacement.Magnitude
     if Result then
-        -- Orient the embedded shaft along velocity at the collision time, rather than the prior step.
+        -- Use the velocity at impact to set the arrow's angle.
         local Fraction = math.clamp(Result.Distance / Displacement.Magnitude, 0, 1)
-        Self.velocity += Gravity * (DeltaTime * Fraction)
+        Self.Vel += Gravity * (DeltaTime * Fraction)
         Self:Stick(Result, Time)
         return
     end
-    Self.position += Displacement
-    Self.velocity += Gravity * DeltaTime
-    Self.model:PivotTo(CFrame.lookAt(Self.position, Self.position + Self.velocity))
-    if Self.age >= 5 or Self.distance >= 500 or Self.position.Y < Spawn.Position.Y - 50 then
-        -- Time, distance and height bounds reclaim missed arrows even when they never touch geometry.
+    Self.Pos += Displacement
+    Self.Vel += Gravity * DeltaTime
+    Self.Model:PivotTo(CFrame.lookAt(Self.Pos, Self.Pos + Self.Vel))
+    if Self.Age >= 5 or Self.Dist >= 500 or Self.Pos.Y < Spawn.Position.Y - 50 then
+        -- Recycle arrows that fly too long, too far, or below the range.
         Self:Resolve(nil)
         Self:Release()
     end
 end
 
 local function BeginChallenge(Player, Session, Time)
-    if Time - Session.lastRestart < 2 then
+    if Time - Session.LastRestart < 2 then
         return
     end
-    Session.lastRestart = Time
+    Session.LastRestart = Time
     for _, Arrow in ActiveArrows do
-        if Arrow.player == Player then
+        if Arrow.Player == Player then
             Arrow:Release()
         end
     end
-    Session.id += 1
-    Session.drawAt = nil
-    Session.score = 0
-    Session.hits = 0
-    Session.shots = 0
-    Session.streak = 0
-    Session.mode = "Challenge"
-    Session.endsAt = Time + RoundSeconds
+    Session.Id += 1
+    Session.DrawAt = nil
+    Session.Score = 0
+    Session.Hits = 0
+    Session.Shots = 0
+    Session.Streak = 0
+    Session.Mode = "Challenge"
+    Session.EndsAt = Time + RoundSeconds
     Remote:FireClient(Player, "Round", string.format("Challenge started — %d seconds. Every ring counts.", RoundSeconds))
     SendState(Player, Session)
 end
 
 local function FireArrow(Player, Session, Direction, Time)
-    local Started = Session.drawAt
-    -- Consume the draw once before validation: replaying the same Release cannot create another shot.
-    Session.drawAt = nil
-    if not Started or not ValidDirection(Direction) or Time - Session.lastShot < Cooldown then
+    local Started = Session.DrawAt
+    -- Clear the draw so the same release cannot fire twice.
+    Session.DrawAt = nil
+    if not Started or not ValidDirection(Direction) or Time - Session.LastShot < Cooldown then
         Remote:FireClient(Player, "Cancel", "Shot cancelled")
         return
     end
@@ -355,7 +355,7 @@ local function FireArrow(Player, Session, Direction, Time)
     end
     Direction = Direction.Unit
     local Power = math.clamp((Time - Started) / ChargeTime, 0, 1)
-    -- Clamp power so holding indefinitely cannot exceed the same maximum launch speed as a normal shot.
+    -- Limit charge to the bow's maximum speed.
     local Speed = MinSpeed + (MaxSpeed - MinSpeed) * Power
     local Params = RaycastParams.new()
     Params.FilterType = Enum.RaycastFilterType.Exclude
@@ -363,9 +363,9 @@ local function FireArrow(Player, Session, Direction, Time)
     Params.IgnoreWater = true
     local AimFrame = CFrame.lookAt(Head.Position, Head.Position + Direction)
     local Origin = AimFrame:PointToWorldSpace(MuzzleRestOffset + MuzzleDrawOffset * Power)
-    -- Both spawn point and power come from server state; the client only supplies its aim direction.
+    -- The server chooses the arrow's start position and power.
     local Obstruction = Workspace:Raycast(Head.Position, Origin - Head.Position, Params)
-    -- The short muzzle offset must also be clear; otherwise shooting beside a wall could bypass it.
+    -- Block shots when a wall is between the player and the arrow tip.
     if Obstruction then
         Remote:FireClient(Player, "Cancel", "Step back from the obstacle")
         return
@@ -375,27 +375,27 @@ local function FireArrow(Player, Session, Direction, Time)
         Remote:FireClient(Player, "Cancel", "Range busy — try again")
         return
     end
-    Session.lastShot = Time
-    -- Count only accepted launches, keeping accuracy consistent when a request is rejected.
-    Session.shots += 1
+    Session.LastShot = Time
+    -- Only count shots that actually fire.
+    Session.Shots += 1
     table.insert(ActiveArrows, Arrow)
-    Remote:FireClient(Player, "Shot", { power = Power, speed = Speed })
+    Remote:FireClient(Player, "Shot", { Power = Power, Speed = Speed })
     SendState(Player, Session)
 end
 
 Remote.OnServerEvent:Connect(function(Player, Action, Payload)
-    -- Roblox supplies player from the connection; a client cannot name another archer in the payload.
+    -- Use the player Roblox supplies, not a name sent by the client.
     local Session = Sessions[Player]
     local Time = Workspace:GetServerTimeNow()
     if not Session or not ConsumeToken(Session, Time) then
         return
     end
     if Action == "Sync" then
-        -- A newly loaded HUD requests state explicitly because PlayerAdded can precede its listener.
+        -- Send the current score when the HUD is ready.
         SendState(Player, Session)
         return
     elseif Action == "Cancel" then
-        Session.drawAt = nil
+        Session.DrawAt = nil
         return
     end
     if not GetArcher(Player) then
@@ -406,13 +406,13 @@ Remote.OnServerEvent:Connect(function(Player, Action, Payload)
         BeginChallenge(Player, Session, Time)
         return
     end
-    if Session.mode == "Complete" or (Session.mode == "Challenge" and Time >= Session.endsAt) then
+    if Session.Mode == "Complete" or (Session.Mode == "Challenge" and Time >= Session.EndsAt) then
         CancelDraw(Player, Session, "Press R or NEW CHALLENGE to play again")
         return
     end
     if Action == "Begin" then
-        if not Session.drawAt and Time - Session.lastShot >= Cooldown then
-            Session.drawAt = Time
+        if not Session.DrawAt and Time - Session.LastShot >= Cooldown then
+            Session.DrawAt = Time
             Remote:FireClient(Player, "Draw", Time)
         else
             Remote:FireClient(Player, "Cancel", "Bow recovering")
@@ -427,9 +427,9 @@ local function PrepareCharacter(Player, Character)
     if not Session then
         return
     end
-    Session.drawAt = nil
-    if Session.deathConnection then
-        Session.deathConnection:Disconnect()
+    Session.DrawAt = nil
+    if Session.DeathConnection then
+        Session.DeathConnection:Disconnect()
     end
     local Root = Character:WaitForChild("HumanoidRootPart", 10)
     local Humanoid = Character:WaitForChild("Humanoid", 10)
@@ -437,22 +437,22 @@ local function PrepareCharacter(Player, Character)
         return
     end
     Character:PivotTo(Spawn.CFrame + Vector3.new(0, 4, 0))
-    Session.deathConnection = Humanoid.Died:Connect(function()
+    Session.DeathConnection = Humanoid.Died:Connect(function()
         CancelDraw(Player, Session, "Respawning at the range")
     end)
 end
 
 local function AddPlayer(Player)
-    -- Scores are per-server-session only. The demo deliberately makes no persistence promise.
+    -- Scores last for this server session and are not saved between visits.
     local Session = {
-        id = 0, score = 0, shots = 0, hits = 0, best = 0, streak = 0,
-        mode = "Practice", endsAt = 0, drawAt = nil,
-        lastShot = -math.huge, lastRestart = -math.huge,
-        tokens = 12, tokenAt = Workspace:GetServerTimeNow(),
+        Id = 0, Score = 0, Shots = 0, Hits = 0, Best = 0, Streak = 0,
+        Mode = "Practice", EndsAt = 0, DrawAt = nil,
+        LastShot = -math.huge, LastRestart = -math.huge,
+        Tokens = 12, TokenAt = Workspace:GetServerTimeNow(),
     }
     Sessions[Player] = Session
     Player.RespawnLocation = Spawn
-    Session.characterConnection = Player.CharacterAdded:Connect(function(Character)
+    Session.CharacterConnection = Player.CharacterAdded:Connect(function(Character)
         PrepareCharacter(Player, Character)
     end)
     if Player.Character then
@@ -464,15 +464,15 @@ Players.PlayerAdded:Connect(AddPlayer)
 Players.PlayerRemoving:Connect(function(Player)
     local Session = Sessions[Player]
     if Session then
-        Session.characterConnection:Disconnect()
-        if Session.deathConnection then
-            Session.deathConnection:Disconnect()
+        Session.CharacterConnection:Disconnect()
+        if Session.DeathConnection then
+            Session.DeathConnection:Disconnect()
         end
     end
     Sessions[Player] = nil
-    -- Release departing players' arrows immediately rather than retaining their Player reference.
+    -- Recycle a player's arrows when they leave.
     for _, Arrow in ActiveArrows do
-        if Arrow.player == Player then
+        if Arrow.Player == Player then
             Arrow:Release()
         end
     end
@@ -484,28 +484,28 @@ end
 RunService.Heartbeat:Connect(function(DeltaTime)
     local Time = Workspace:GetServerTimeNow()
     for _, Target in TargetData do
-        if Target.amplitude > 0 then
-            local Offset = math.sin(Time * Target.frequency + Target.phase) * Target.amplitude
-            -- Multiplying by the base CFrame expresses motion along each target's own horizontal axis.
-            Target.model:PivotTo(Target.base * CFrame.new(Offset, 0, 0))
+        if Target.Amplitude > 0 then
+            local Offset = math.sin(Time * Target.Frequency + Target.Phase) * Target.Amplitude
+            -- Move each target left and right from its starting position.
+            Target.Model:PivotTo(Target.Base * CFrame.new(Offset, 0, 0))
         end
     end
     for _, Projectile in ActiveArrows do
-        if Projectile.stuckAt and not Projectile.released then
+        if Projectile.StuckAt and not Projectile.Released then
             Projectile:FollowSurface()
         end
     end
-    -- Bound catch-up work after a lag spike. One loop owns every projectile instead of per-arrow tasks.
+    -- Limit catch-up steps after lag so one frame does not do too much work.
     HeartbeatAccumulator = math.min(HeartbeatAccumulator + DeltaTime, SimulationStep * 12)
     while HeartbeatAccumulator >= SimulationStep do
         HeartbeatAccumulator -= SimulationStep
         for Index = #ActiveArrows, 1, -1 do
             local Arrow = ActiveArrows[Index]
-            if not Arrow.released and not Arrow.stuckAt then
+            if not Arrow.Released and not Arrow.StuckAt then
                 Arrow:Step(SimulationStep, Time)
             end
-            if Arrow.released then
-                -- Swap removal is O(1); reverse iteration ensures no unprocessed arrow is skipped.
+            if Arrow.Released then
+                -- Replace a removed entry with the last arrow to avoid shifting the list.
                 ActiveArrows[Index] = ActiveArrows[#ActiveArrows]
                 ActiveArrows[#ActiveArrows] = nil
             end
@@ -517,15 +517,15 @@ RunService.Heartbeat:Connect(function(DeltaTime)
     end
     StateAccumulator = 0
     for Player, Session in Sessions do
-        if Session.drawAt and (Time - Session.drawAt > 8 or not GetArcher(Player)) then
+        if Session.DrawAt and (Time - Session.DrawAt > 8 or not GetArcher(Player)) then
             CancelDraw(Player, Session, "Draw cancelled")
         end
-        if Session.mode == "Challenge" and Time >= Session.endsAt then
-            -- Transition once to Complete; remaining projectiles cannot extend the scoring window.
-            Session.mode = "Complete"
-            Session.drawAt = nil
-            Session.best = math.max(Session.best, Session.score)
-            Remote:FireClient(Player, "Round", string.format("Round complete — %d points. Press R to retry.", Session.score))
+        if Session.Mode == "Challenge" and Time >= Session.EndsAt then
+            -- End the round once and stop accepting extra points.
+            Session.Mode = "Complete"
+            Session.DrawAt = nil
+            Session.Best = math.max(Session.Best, Session.Score)
+            Remote:FireClient(Player, "Round", string.format("Round complete — %d points. Press R to retry.", Session.Score))
             SendState(Player, Session)
         end
     end
